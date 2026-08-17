@@ -1,0 +1,11 @@
+# 登录会话档案（含 ChatGPT cookie，严禁上传！）
+gpt_profile/
+gpt_profile
+
+# Python 缓存
+__pycache__/
+*.pyc
+
+# 日志与临时文件
+*.log
+*.tmp
