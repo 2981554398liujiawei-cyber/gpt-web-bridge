@@ -24,6 +24,7 @@ import argparse
 import ctypes
 import json
 import os
+import re
 import subprocess
 import sys
 import time
@@ -353,17 +354,40 @@ def session_links(page, limit=100):
 
 
 def open_conversation(page, name):
-    """打开指定名称的会话：扫描侧边栏（title 子串匹配）+ href 精确定位点击。
-
-    回归初始版本的策略——不依赖搜索框（UI 版本差异/时序都不稳定）：
-    直接遍历侧边栏 `a[href*="/c/"]`，找到匹配项后用 href 二次定位再点击，
-    并验证 URL 进入 /c/。找不到返回 False（由调用方决定新建/报错）。
+    """打开指定名称/URL 的会话。优先级：① 参数是会话 URL 直接导航 →
+    ② 名称缓存 URL 直接导航（跳过侧边栏）→ ③ 侧边栏按名称查找
+    （title 子串匹配 + href 精确定位点击 + 滚动加载 30s）。成功后把
+    名称→URL 写入缓存，下次直开。找不到返回 False（调用方决定新建/报错）。
     """
     name = name.strip()
     if not name:
         return False
-    page.wait_for_timeout(2500)  # 等侧边栏渲染
-    deadline = time.time() + 20
+    # ① 参数本身是会话 URL / /c/<uuid>：直接导航，不依赖侧边栏
+    if "/c/" in name or name.startswith("http"):
+        m = re.search(r"/c/([0-9a-fA-F-]+)", name)
+        if m:
+            url = "https://chatgpt.com/c/" + m.group(1)
+            try:
+                page.goto(url, wait_until="domcontentloaded")
+                page.wait_for_url(lambda u: "/c/" in u, timeout=15000)
+                _conv_map_set(name, url)
+                _stdout(f"[已打开会话 URL] {url}")
+                return True
+            except Exception:
+                return False
+    # ② 名称缓存命中：直接 URL 导航（最稳，跳过侧边栏）
+    cached = _conv_map_get(name)
+    if cached and "/c/" in cached:
+        try:
+            page.goto(cached, wait_until="domcontentloaded")
+            page.wait_for_url(lambda u: "/c/" in u, timeout=15000)
+            _stdout(f"[已打开缓存会话] {name} -> {cached}")
+            return True
+        except Exception:
+            pass  # 缓存失效（会话被删/归档）→ 回退侧边栏查找
+    # ③ 侧边栏按名称查找（虚拟列表：滚动加载 + 多次扫描）
+    page.wait_for_timeout(3000)  # 等侧边栏渲染
+    deadline = time.time() + 30
     while time.time() < deadline:
         sessions = session_links(page)
         match = None
@@ -385,6 +409,8 @@ def open_conversation(page, name):
                 page.wait_for_url(lambda u: "/c/" in u, timeout=15000)
             except Exception:
                 pass
+            if match[1]:
+                _conv_map_set(name, match[1])
             _stdout(f"[已定位会话] {match[0]} {match[1]}")
             return True
         # 侧边栏是虚拟列表：悬停侧边栏后滚动，再扫下一轮
@@ -401,6 +427,37 @@ def open_conversation(page, name):
 
 
 SESSION_MAP_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "session_map.json")
+CONVERSATION_MAP_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "conversation_map.json")
+
+
+def _conv_map_get(name):
+    """名称 -> 会话 URL 缓存查询（conversation 名称 → /c/<uuid>）。"""
+    try:
+        with open(CONVERSATION_MAP_FILE, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        return data.get(name) if isinstance(data, dict) else None
+    except Exception:
+        return None
+
+
+def _conv_map_set(name, url):
+    """记录 名称 → 会话 URL，下次直接 URL 导航（跳过侧边栏查找）。"""
+    try:
+        m = {}
+        try:
+            with open(CONVERSATION_MAP_FILE, "r", encoding="utf-8") as f:
+                m = json.load(f)
+        except Exception:
+            m = {}
+        if not isinstance(m, dict):
+            m = {}
+        m[name] = url
+        tmp = CONVERSATION_MAP_FILE + ".tmp"
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump(m, f, ensure_ascii=False, indent=2)
+        os.replace(tmp, CONVERSATION_MAP_FILE)
+    except Exception as exc:
+        print(f"[警告] 保存会话名映射失败：{exc}", file=sys.stderr)
 
 
 def _load_session_map():

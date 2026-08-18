@@ -39,6 +39,7 @@ CHAT_URL = "https://chatgpt.com/"
 HERE = os.path.dirname(os.path.abspath(__file__))
 PROFILE = os.path.join(HERE, "gpt_profile")
 SESSION_MAP_FILE = os.path.join(HERE, "session_map.json")
+CONVERSATION_MAP_FILE = os.path.join(HERE, "conversation_map.json")
 DEFAULT_PORT = 3090
 VIEWPORT = {"width": 1280, "height": 900}
 FRAME_FPS = 15                 # 可见会话的目标帧率
@@ -168,6 +169,36 @@ def _session_map_del(key):
     if key in m:
         del m[key]
         _save_session_map(m)
+
+
+# 名称 -> 会话 URL 缓存（conversation 名称 → /c/<uuid>）：第一次按名称在
+# 侧边栏找到后记录，之后直接用 URL 直开，跳过不可靠的侧边栏查找
+def _conv_map_get(name):
+    try:
+        with open(CONVERSATION_MAP_FILE, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        return data.get(name) if isinstance(data, dict) else None
+    except Exception:
+        return None
+
+
+def _conv_map_set(name, url):
+    try:
+        m = {}
+        try:
+            with open(CONVERSATION_MAP_FILE, "r", encoding="utf-8") as f:
+                m = json.load(f)
+        except Exception:
+            m = {}
+        if not isinstance(m, dict):
+            m = {}
+        m[name] = url
+        tmp = CONVERSATION_MAP_FILE + ".tmp"
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump(m, f, ensure_ascii=False, indent=2)
+        os.replace(tmp, CONVERSATION_MAP_FILE)
+    except Exception as exc:
+        print(f"[警告] 保存会话名映射失败：{exc}", file=sys.stderr)
 
 
 def _kill_profile_chrome():
@@ -866,13 +897,39 @@ class BrowserService:
         return u
 
     async def _open_conversation(self, page, name):
+        """打开指定会话。优先级：① 参数是 URL 直接导航 → ② 名称缓存 URL
+        直接导航（跳过侧边栏）→ ③ 侧边栏按名称查找（增强：等 3s、扫 100
+        链接、滚动加载 30s）。成功后把 名称→URL 写入缓存，下次直开。"""
         name = name.strip()
         if not name:
             return False
-        await page.wait_for_timeout(2500)
-        deadline = time.time() + 20
+        # ① 参数本身是会话 URL / /c/<uuid>：直接导航，不依赖侧边栏
+        if "/c/" in name or name.startswith("http"):
+            import re
+            m = re.search(r"/c/([0-9a-fA-F-]+)", name)
+            if m:
+                url = f"https://chatgpt.com/c/{m.group(1)}"
+                try:
+                    await page.goto(url, wait_until="domcontentloaded")
+                    await page.wait_for_url(lambda u: "/c/" in u, timeout=15000)
+                    _conv_map_set(name, url)
+                    return True
+                except Exception:
+                    return False
+        # ② 名称缓存命中：直接 URL 导航（最稳，跳过侧边栏）
+        cached = _conv_map_get(name)
+        if cached and "/c/" in cached:
+            try:
+                await page.goto(cached, wait_until="domcontentloaded")
+                await page.wait_for_url(lambda u: "/c/" in u, timeout=15000)
+                return True
+            except Exception:
+                pass  # 缓存失效（会话被删/归档）→ 回退侧边栏查找
+        # ③ 侧边栏按名称查找（虚拟列表：滚动加载 + 多次扫描）
+        await page.wait_for_timeout(3000)
+        deadline = time.time() + 30
         while time.time() < deadline:
-            sessions = await self._session_links(page)
+            sessions = await self._session_links(page, limit=100)
             match = None
             for t, href in sessions:
                 if t and name.lower() in t.lower():
@@ -891,6 +948,8 @@ class BrowserService:
                     await page.wait_for_url(lambda u: "/c/" in u, timeout=15000)
                 except Exception:
                     pass
+                if match[1]:
+                    _conv_map_set(name, match[1])
                 return True
             try:
                 await page.locator('nav').first.hover()
