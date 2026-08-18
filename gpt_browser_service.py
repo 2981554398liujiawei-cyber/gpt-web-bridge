@@ -75,6 +75,50 @@ async def cors_middleware(request, handler):
         resp.headers["Access-Control-Allow-Headers"] = "Content-Type"
     return resp
 
+
+# --------------------------------------------------------------------------
+# 模型可读性：页面快照（浏览器端提取文本 + 可交互元素 + 建议选择器）
+# --------------------------------------------------------------------------
+SNAPSHOT_JS = r"""
+() => {
+  const clean = (s) => (s || '').replace(/\s+/g, ' ').trim();
+  const text = (document.body ? document.body.innerText : '') || '';
+  const els = document.querySelectorAll(
+    'button, a, input, textarea, select, [contenteditable="true"], [role="button"], [role="link"], [role="textbox"], [role="menuitem"], [role="tab"]'
+  );
+  const out = [];
+  for (const el of els) {
+    if (out.length >= 30) break;
+    const r = el.getBoundingClientRect();
+    if (!r || (r.width === 0 && r.height === 0)) continue;
+    const cs = getComputedStyle(el);
+    if (cs.visibility === 'hidden' || cs.display === 'none' || cs.opacity === '0') continue;
+    const tag = el.tagName.toLowerCase();
+    const aria = el.getAttribute('aria-label') || '';
+    const ph = el.getAttribute('placeholder') || '';
+    const inner = clean(el.innerText).slice(0, 80);
+    if (!aria && !ph && !inner && tag !== 'input' && tag !== 'textarea') continue;
+    let sel = '';
+    if (aria) sel = '[aria-label="' + aria.replace(/"/g, '&quot;') + '"]';
+    else if (ph) sel = tag + '[placeholder="' + ph.replace(/"/g, '&quot;') + '"]';
+    else if (inner && (tag === 'button' || tag === 'a')) {
+      const q = inner.slice(0, 40).replace(/"/g, '&quot;');
+      sel = tag + ':has-text("' + q + '")';
+    } else sel = tag;
+    out.push({
+      tag,
+      role: el.getAttribute('role') || '',
+      text: inner,
+      aria,
+      placeholder: ph,
+      href: el.href || '',
+      sel,
+    });
+  }
+  return { text: text.slice(0, 6000), interactives: out };
+}
+"""
+
 AUTH_BROWSER_ARGS = [
     "--disable-blink-features=AutomationControlled",
     "--no-first-run",
@@ -655,6 +699,104 @@ class BrowserService:
             return web.json_response({"ok": False, "error": err, "reply": reply})
         return web.json_response({"ok": True, "reply": reply})
 
+    # ---------------- 模型可读性 + 元素级操作 ----------------
+    async def api_snapshot(self, request):
+        """页面快照：标题/URL/可见文本/可交互元素（含建议选择器）+ 可选截图。
+
+        对标 Codex：让模型"看到"页面状态。截图默认不返回（省流量），
+        查询参数 ?shot=1 时附 base64 JPEG。
+        """
+        async def handler(s):
+            try:
+                title = await s.page.title()
+            except Exception:
+                title = ""
+            url = s.page.url
+            try:
+                info = await s.page.evaluate(SNAPSHOT_JS)
+            except Exception as exc:
+                return web.json_response(
+                    {"ok": False, "error": f"快照提取失败：{exc}"})
+            resp = {
+                "ok": True,
+                "title": title,
+                "url": url,
+                "text": info.get("text", "") if isinstance(info, dict) else "",
+                "interactives": info.get("interactives", []) if isinstance(info, dict) else [],
+            }
+            want = (request.query.get("shot") or request.query.get("screenshot") or "").strip()
+            if want and want not in ("0", "false", "no"):
+                try:
+                    shot = await s.page.screenshot(type="jpeg", quality=70)
+                    resp["screenshot_b64"] = base64.b64encode(shot).decode()
+                except Exception as exc:
+                    resp["screenshot_error"] = str(exc)
+            return web.json_response(resp)
+        return await self._with_session(request, handler)
+
+    async def api_act(self, request):
+        """元素级操作：用 locator 精确点击/输入，替代坐标点击的脆弱性。
+
+        op:
+          click:  locator(sel).nth(index).click()
+          type:   locator(sel).nth(index).click() 后 fill(text)（失败回退键盘输入）
+          press:  page.keyboard.press(key)（如 "Enter"）
+          text:   page.keyboard.type(text)（在当前聚焦处输入）
+          scroll: 有 sel 则滚动到元素；否则 page.mouse.wheel(0, deltaY)
+          wait:   page.wait_for_timeout(ms)
+        """
+        async def handler(s):
+            try:
+                body = await request.json()
+            except Exception:
+                return web.json_response({"ok": False, "error": "bad json"}, status=400)
+            op = (body.get("op") or "").strip()
+            sel = (body.get("sel") or "").strip()
+            text = body.get("text") or ""
+            key = body.get("key") or ""
+            try:
+                index = int(body.get("index", 0) or 0)
+                delta_y = int(body.get("deltaY", 600) or 600)
+                ms = int(body.get("ms", 800) or 800)
+            except ValueError:
+                return web.json_response({"ok": False, "error": "index/deltaY/ms 需为整数"})
+            page = s.page
+            try:
+                if op in ("click", "type") and not sel:
+                    return web.json_response({"ok": False, "error": "click/type 需要 sel"})
+                if op == "click":
+                    loc = page.locator(sel).nth(index)
+                    await loc.scroll_into_view_if_needed(timeout=5000)
+                    await loc.click(timeout=8000)
+                elif op == "type":
+                    loc = page.locator(sel).nth(index)
+                    await loc.scroll_into_view_if_needed(timeout=5000)
+                    await loc.click(timeout=8000)
+                    try:
+                        await loc.fill(text)
+                    except Exception:
+                        await page.keyboard.type(text)
+                elif op == "press":
+                    if not key:
+                        return web.json_response({"ok": False, "error": "press 需要 key"})
+                    await page.keyboard.press(key)
+                elif op == "text":
+                    await page.keyboard.type(text)
+                elif op == "scroll":
+                    if sel:
+                        await page.locator(sel).nth(index).scroll_into_view_if_needed(timeout=5000)
+                    else:
+                        await page.mouse.wheel(0, delta_y)
+                elif op == "wait":
+                    await page.wait_for_timeout(ms)
+                else:
+                    return web.json_response({"ok": False, "error": f"未知操作 {op}（click/type/press/text/scroll/wait）"})
+            except Exception as exc:
+                return web.json_response({"ok": False, "error": f"{op} 失败：{exc}"})
+            await self._refresh_css_viewport(s)
+            return web.json_response({"ok": True, "url": page.url})
+        return await self._with_session(request, handler)
+
     async def api_close(self, request):
         key = self._session_param(request)
         s = self.sessions.pop(key, None)
@@ -977,6 +1119,10 @@ def main():
         app.router.add_get("/debug", svc.api_debug)
         app.router.add_get("/stream", svc.ws_stream)
         app.router.add_post("/ask", svc.api_ask)
+        app.router.add_get("/snapshot", svc.api_snapshot)
+        app.router.add_post("/snapshot", svc.api_snapshot)
+        app.router.add_post("/act", svc.api_act)
+        app.router.add_get("/act", svc.api_act)
         app.router.add_post("/open", svc.api_open)
         app.router.add_post("/new", svc.api_new)
         app.router.add_post("/navigate", svc.api_navigate)
