@@ -204,14 +204,16 @@ def _conv_map_set(name, url):
 def _kill_profile_chrome():
     """杀掉占用 gpt_profile 的残留 Chrome（单实例锁）。"""
     try:
-        # CREATE_NO_WINDOW：禁止弹出 PowerShell 控制台窗口（否则每次清理都闪现）
+        # CREATE_NO_WINDOW：禁止弹出 PowerShell 控制台窗口（否则每次清理都闪现）。
+        # 不捕获输出（DEVNULL）：detached 服务进程里管道捕获易失败/超时，
+        # taskkill 结果不需要回读。
         subprocess.run(
             ["powershell", "-NoProfile", "-Command",
              "Get-CimInstance Win32_Process -Filter \"Name='chrome.exe'\" | "
              "Where-Object { $_.CommandLine -match 'gpt_profile' } | "
              "ForEach-Object { taskkill /PID $_.ProcessId /T /F }"],
-            capture_output=True, timeout=30,
-            creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
+            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+            timeout=60, creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
     except Exception as exc:
         print(f"[警告] 清理残留 Chrome 失败：{exc}", file=sys.stderr)
 
@@ -285,6 +287,7 @@ class BrowserSession:
         self.last_active_at = time.time()
         self.dead = False
         self._screencast_on = False
+        self.broadcast_task = None  # 帧广播任务（close 时取消，避免泄漏）
         # 页面实际 CSS viewport（innerWidth/innerHeight）——输入坐标基准；
         # 可能被窗口系统 clamp，必须实时读而不是用 launch 时的设置值
         self.css_w = VIEWPORT["width"]
@@ -315,6 +318,9 @@ class BrowserSession:
                 await self.cdp.send("Page.stopScreencast")
         except Exception:
             pass
+        if self.broadcast_task is not None:
+            self.broadcast_task.cancel()
+            self.broadcast_task = None
         try:
             await asyncio.wait_for(self.ctx.close(), timeout=15)
         except Exception:
@@ -402,7 +408,7 @@ class BrowserService:
         ctx.on("page", lambda p: asyncio.create_task(self._adopt_page(s, p)))
         self.sessions[key] = s
         await self._refresh_css_viewport(s)
-        asyncio.create_task(self._broadcast_loop(s))
+        s.broadcast_task = asyncio.create_task(self._broadcast_loop(s))
         print(f"[会话] 创建浏览器槽 session={key} "
               f"logged_in={s.logged_in()} sessions={len(self.sessions)}")
         return s
@@ -881,7 +887,7 @@ class BrowserService:
         n = min(await links.count(), limit)
         for i in range(n):
             try:
-                href = links.nth(i).get_attribute("href")
+                href = await links.nth(i).get_attribute("href")
                 text = (await links.nth(i).inner_text(timeout=1200)) or ""
                 title = text.strip().splitlines()[0] if text.strip() else ""
             except Exception:
@@ -939,7 +945,7 @@ class BrowserService:
                 links = page.locator('a[href*="/c/"]')
                 for i in range(await links.count()):
                     try:
-                        if (links.nth(i).get_attribute("href") or "") == match[1]:
+                        if (await links.nth(i).get_attribute("href") or "") == match[1]:
                             await links.nth(i).click(timeout=5000)
                             break
                     except Exception:
@@ -975,7 +981,7 @@ class BrowserService:
                     links = page.locator('a[href*="/c/"]')
                     for i in range(await links.count()):
                         try:
-                            if self._norm_url(links.nth(i).get_attribute("href") or "") == self._norm_url(url):
+                            if self._norm_url(await links.nth(i).get_attribute("href") or "") == self._norm_url(url):
                                 await links.nth(i).click(timeout=5000)
                                 break
                         except Exception:
@@ -1133,20 +1139,47 @@ class BrowserService:
                     del self.sessions[key]
 
     async def _watchdog(self):
-        """周期隐藏浏览器窗口（新弹窗也隐藏）+ auth 页面死亡时自杀退出。"""
+        """周期隐藏浏览器窗口（新弹窗也隐藏）+ auth 页面死亡时自愈重启。"""
+        fail_streak = 0
         while True:
             await asyncio.sleep(3)
-            if self._started:
-                try:
-                    _hide_profile_chrome_windows()
-                except Exception:
-                    pass
-                try:
-                    if self.auth_page is None or self.auth_page.is_closed():
-                        print("[服务] 浏览器已关闭，进程退出", file=sys.stderr)
-                        os._exit(1)
-                except Exception:
-                    os._exit(1)
+            if not self._started:
+                continue
+            try:
+                _hide_profile_chrome_windows()
+            except Exception:
+                pass
+            try:
+                if self.auth_page is None or self.auth_page.is_closed():
+                    # 自愈：auth 页面崩溃/被关 → 清理残留 → 重启浏览器，而不是
+                    # 立即自杀退出（自杀会让面板 offline，且残留窗口可能可见）
+                    print("[服务] auth 页面已关闭，尝试重启浏览器", file=sys.stderr)
+                    _kill_profile_chrome()
+                    await asyncio.sleep(2)  # 等旧 Chrome 彻底退出，释放 profile 锁
+                    fail_streak += 1
+                    try:
+                        # 关键：必须复位状态，ensure_browser 才会真正重新 launch
+                        # （否则开头 if _started 直接 return，形成假重启死循环）
+                        self._started = False
+                        self.browser = None
+                        self.auth_ctx = None
+                        self.auth_page = None
+                        await self.ensure_browser()
+                        # 旧会话的页面随旧 browser 失效，全部作废，前端重连时重建
+                        for s in list(self.sessions.values()):
+                            s.dead = True
+                        print("[服务] 浏览器重启成功", file=sys.stderr)
+                        fail_streak = 0
+                    except Exception as exc:
+                        print(f"[服务] 浏览器重启失败（{fail_streak}）：{exc}", file=sys.stderr)
+                        if fail_streak >= 3:
+                            print("[服务] 连续重启失败，清理残留后退出", file=sys.stderr)
+                            _kill_profile_chrome()
+                            os._exit(1)
+            except Exception as exc:
+                print(f"[服务] watchdog 异常：{exc}", file=sys.stderr)
+                _kill_profile_chrome()
+                os._exit(1)
 
     # ---------------- 退出 ----------------
     async def shutdown(self):
